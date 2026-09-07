@@ -33,19 +33,29 @@ class CheckResult:
 # technical
 # ----------------------------------------------------------------------------
 MASTER_FORMATS = {"TIFF", "PNG"}
+ACCESS_FORMATS = {"JPEG", "PNG"}
+ROLE_FORMATS = {"master": MASTER_FORMATS, "access": ACCESS_FORMATS}
 
 
-def check_format(img: Image.Image) -> CheckResult:
+def check_format(img: Image.Image, role: str = "master") -> CheckResult:
     fmt = img.format or "?"
-    ok = fmt in MASTER_FORMATS
-    return CheckResult("format", PASS if ok else FAIL, fmt, sorted(MASTER_FORMATS),
-                       "" if ok else "lossy or non-master format for a preservation master")
+    allowed = ROLE_FORMATS.get(role, MASTER_FORMATS)
+    ok = fmt in allowed
+    why = ("lossy or non-master format for a preservation master" if role == "master"
+           else "unexpected format for an access copy")
+    return CheckResult("format", PASS if ok else FAIL, fmt, sorted(allowed), "" if ok else why)
 
 
 def check_dpi(img: Image.Image, expected: int, tol: float = 0.02) -> CheckResult:
     dpi = img.info.get("dpi")
-    if not dpi:
-        return CheckResult("dpi", FAIL, None, expected, "no resolution metadata embedded")
+    if not dpi or float(dpi[0]) <= 1.0:
+        # Absent metadata is not the same fault as a wrong value. A TIFF with no
+        # resolution tags reads back as (1, 1) in PIL; a JPEG without JFIF
+        # density reads back as nothing. Either way nobody wrote the number
+        # down; the scan itself may be fine. That is a question for a person,
+        # not a reprocess order.
+        return CheckResult("dpi", WARN, None, expected,
+                           f"no resolution metadata embedded; declared {expected} ppi could not be verified")
     x = float(dpi[0])
     ok = abs(x - expected) <= tol * expected
     return CheckResult("dpi", PASS if ok else FAIL, round(x, 1), expected,
@@ -54,7 +64,7 @@ def check_dpi(img: Image.Image, expected: int, tol: float = 0.02) -> CheckResult
 
 def check_bit_depth(img: Image.Image) -> CheckResult:
     mode = img.mode
-    ok = mode in {"L", "RGB", "I;16", "RGB;16", "I;16B"}
+    ok = mode in {"L", "RGB", "I;16", "RGB;16", "I;16B", "I;16L", "I"}
     return CheckResult("bit_depth", PASS if ok else WARN, mode, "L/RGB/16-bit",
                        "" if ok else "unusual pixel mode for a master (palette, 1-bit, or alpha)")
 
@@ -64,6 +74,15 @@ def check_bit_depth(img: Image.Image) -> CheckResult:
 # ----------------------------------------------------------------------------
 
 def to_gray(img: Image.Image) -> np.ndarray:
+    """8-bit greyscale for measurement.
+
+    PIL's ``convert("L")`` clips 16-bit images at 255, which turns a correctly
+    exposed 16-bit master into a white sheet. Scale those by their range first.
+    """
+    if img.mode in ("I;16", "I;16B", "I;16L", "I"):
+        arr = np.asarray(img, dtype=np.float32)
+        top = 65535.0 if arr.max() > 255 else 255.0
+        return np.clip(arr / top * 255.0 + 0.5, 0, 255).astype(np.uint8)
     return np.asarray(img.convert("L"), dtype=np.uint8)
 
 
@@ -241,3 +260,16 @@ def batch_region_consistency(vectors: list[np.ndarray], floor=0.5, drop=0.35,
                                {"batch_median": round(typical, 3), "floor": floor, "drop": drop},
                                "target region unlike the rest of the batch" if status == FAIL else ""))
     return out
+
+
+# ----------------------------------------------------------------------------
+# master / access pairing
+# ----------------------------------------------------------------------------
+
+def check_pairing(role: str, has_partner: bool) -> CheckResult:
+    """Every master should have an access copy and every access copy a master."""
+    if has_partner:
+        return CheckResult("pairing", PASS, True, "master<->access", "")
+    note = ("no access copy found for this master" if role == "master"
+            else "access copy without a master in this folder")
+    return CheckResult("pairing", WARN, False, "master<->access", note)

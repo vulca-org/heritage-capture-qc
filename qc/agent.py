@@ -49,7 +49,7 @@ def triage(results: list[C.CheckResult]) -> str:
 
 
 def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dpi: int | None = None,
-           vlm=None, vlm_mode: str = "none", batch_context: str = "") -> dict:
+           vlm=None, vlm_mode: str = "none", batch_context: str = "", access_dpi: int | None = None) -> dict:
     dev = VirtualScanner(batch_dir, expected_dpi=expected_dpi or 400, out_dir=out_dir)
     # The agent reads the device's own description before acting.
     doc = dev.reference_doc()
@@ -61,47 +61,68 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
     for item in manifest:
         img = dev.read("image", path=item["path"])
         gray = C.to_gray(img)
+        is_access = access_dpi is not None and (
+            (img.format or "").upper() == "JPEG" or Path(item["name"]).suffix.lower() in (".jpg", ".jpeg"))
         per_file.append({
             "item": item, "img": img, "gray": gray,
+            "role": "access" if is_access else "master",
             "sharp": C.sharpness(gray),
             "sha": C.file_sha256(item["path"]),
             "vec": C.thumb_vector(gray),
             "region": C.region_vector(gray),
         })
 
-    med_sharp = float(np.median([f["sharp"] for f in per_file])) if per_file else 0.0
-
-    # batch-level: exact and near duplicates (flag the later file)
-    seen_sha = {}
-    dup_exact, dup_near = {}, {}
+    # Batch-relative statistics are computed within a role. An access copy is,
+    # by construction, a near-duplicate of its master and softer than it; only
+    # its siblings are a fair reference.
+    groups: dict[str, list[int]] = {}
     for i, f in enumerate(per_file):
-        if f["sha"] in seen_sha:
-            dup_exact[i] = seen_sha[f["sha"]]
-        else:
-            seen_sha[f["sha"]] = i
-            for j in range(i):
-                if j in dup_exact: continue
-                if float(np.dot(f["vec"], per_file[j]["vec"])) >= 0.998:
-                    dup_near[i] = j
-                    break
-    missing, dup_seq = C.check_sequence([f["item"]["seq"] for f in per_file])
-    region_results = C.batch_region_consistency([f["region"] for f in per_file])
+        groups.setdefault(f["role"], []).append(i)
+    med_sharp_by_role, dup_exact, dup_near, region_results = {}, {}, {}, {}
+    missing_by_role, dupseq_by_role = {}, {}
+    for role, idx in groups.items():
+        med_sharp_by_role[role] = float(np.median([per_file[i]["sharp"] for i in idx]))
+        seen_sha = {}
+        for pos, i in enumerate(idx):
+            f = per_file[i]
+            if f["sha"] in seen_sha:
+                dup_exact[i] = seen_sha[f["sha"]]
+            else:
+                seen_sha[f["sha"]] = i
+                for j in idx[:pos]:
+                    if j in dup_exact: continue
+                    if float(np.dot(f["vec"], per_file[j]["vec"])) >= 0.998:
+                        dup_near[i] = j
+                        break
+        missing_by_role[role], dupseq_by_role[role] = C.check_sequence([per_file[i]["item"]["seq"] for i in idx])
+        for i, r in zip(idx, C.batch_region_consistency([per_file[i]["region"] for i in idx])):
+            region_results[i] = r
+    med_sharp = med_sharp_by_role.get("master", 0.0)
+    missing = missing_by_role.get("master", [])
+
+    # master <-> access pairing, by file stem (photo_0007.tif <-> photo_0007.jpg)
+    stems_by_role = {role: {Path(per_file[i]["item"]["name"]).stem.lower() for i in idx}
+                     for role, idx in groups.items()}
 
     # pass 2: checks + triage
     report, reshoot = [], []
     for i, f in enumerate(per_file):
-        img, gray, item = f["img"], f["gray"], f["item"]
+        img, gray, item, role = f["img"], f["gray"], f["item"], f["role"]
         res = [
-            C.check_format(img),
-            C.check_dpi(img, dpi),
+            C.check_format(img, role),
+            C.check_dpi(img, access_dpi if role == "access" else dpi),
             C.check_bit_depth(img),
-            C.check_blur(f["sharp"], med_sharp),
+            C.check_blur(f["sharp"], med_sharp_by_role[role]),
             C.check_glare(gray),
             C.check_exposure(gray),
             C.check_skew(C.estimate_skew(gray)),
             C.check_margins(gray),
             region_results[i],
         ]
+        if access_dpi is not None:
+            other = "access" if role == "master" else "master"
+            res.append(C.check_pairing(role, Path(item["name"]).stem.lower() in stems_by_role.get(other, set())))
+        dup_seq = dupseq_by_role[role]
         if i in dup_exact:
             res.append(C.CheckResult("duplicate", C.FAIL, per_file[dup_exact[i]]["item"]["name"], "sha256",
                                      "byte-identical to an earlier capture"))
@@ -116,7 +137,7 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         for r in res:
             if r.status != C.PASS:
                 dev.write("flag", {"file": item["name"], **r.to_dict()})
-        report.append({"file": item["name"], "seq": item["seq"], "action": action,
+        report.append({"file": item["name"], "seq": item["seq"], "role": role, "action": action,
                        "checks": [r.to_dict() for r in res]})
 
     # pass 3: VLM triage over the selected frames (adds problems, never clears one)
@@ -126,7 +147,8 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         path_of = {f["item"]["name"]: f["item"]["path"] for f in per_file}
         ctx = batch_context or (f"Batch of {len(per_file)} frames captured at {dpi} ppi. "
                                 "Frames in this batch normally show a single page and nothing else.")
-        for fname in select_for_vlm(report, vlm_mode):
+        # only masters go to the model; an access copy shows the same picture
+        for fname in select_for_vlm([r for r in report if r["role"] == "master"], vlm_mode):
             v: VLMVerdict = vlm.judge(path_of[fname], ctx)
             vlm_records.append(v.to_dict())
             row = by_name[fname]
@@ -147,8 +169,11 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         "batch": str(Path(batch_dir)),
         "n_files": len(per_file),
         "expected_dpi": dpi,
+        "access_dpi": access_dpi,
+        "roles": dict(Counter(f["role"] for f in per_file)),
         "batch_median_sharpness": round(med_sharp, 4),
         "missing_sequence": missing,
+        "missing_sequence_access": missing_by_role.get("access", []) if access_dpi is not None else None,
         "actions": dict(Counter(r["action"] for r in report)),
         "reshoot": reshoot,
         "files": report,
@@ -172,12 +197,14 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
 
 def render_md(s: dict) -> str:
     lines = [f"# QC report — {Path(s['batch']).name}", "",
-             f"files: {s['n_files']}  declared: {s['expected_dpi']} ppi  actions: {s['actions']}",
+             f"files: {s['n_files']}  declared: {s['expected_dpi']} ppi"
+             + (f" (access copies {s['access_dpi']} ppi, roles {s['roles']})" if s.get("access_dpi") else "")
+             + f"  actions: {s['actions']}",
              f"missing sequence numbers: {s['missing_sequence'] or 'none'}",
              (f"VLM: {s['vlm']['backend']} mode={s['vlm']['mode']} judged={s['vlm']['n_judged']} "
               f"errors={s['vlm']['n_errors']} escalated={s['vlm']['escalated'] or 'none'}")
              if s.get("vlm", {}).get("backend") else "VLM: not run", "",
-             "| file | seq | action | measured faults | seen by VLM |", "|---|---|---|---|---|"]
+             "| file | seq | role | action | measured faults | seen by VLM |", "|---|---|---|---|---|---|"]
     for f in s["files"]:
         rules = ", ".join(f"{c['check']}={c['value']}" for c in f["checks"] if c["status"] != "pass")
         v = f.get("vlm")
@@ -189,7 +216,7 @@ def render_md(s: dict) -> str:
             seen = "; ".join(f"**{i['issue']}** ({i['severity']}): {i['evidence']}" for i in v["issues"])
         else:
             seen = "nothing"
-        lines.append(f"| {f['file']} | {f['seq']} | **{f['action']}** | {rules or '—'} | {seen} |")
+        lines.append(f"| {f['file']} | {f['seq']} | {f.get('role', 'master')} | **{f['action']}** | {rules or '—'} | {seen} |")
     lines += ["", "## Reshoot list"]
     lines += [f"- {n}" for n in s["reshoot"]] or ["- none"]
     return "\n".join(lines) + "\n"

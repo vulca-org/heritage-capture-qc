@@ -7,7 +7,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from fixtures.make_fixtures import make  # noqa: E402
+from fixtures.make_fixtures import make, make_archive_fixtures  # noqa: E402
 from qc.agent import run_qc  # noqa: E402
 from mhs_shim.manifest import ObjectSafetyManifest, BudgetExceeded  # noqa: E402
 from mhs_shim.backends.rti_sim import RTISimulator  # noqa: E402
@@ -308,3 +308,75 @@ def test_the_conservator_figure_builds_and_states_its_caveats(stack, tmp_path):
     src = inspect.getsource(__import__("qc.rti_figure", fromlist=["build"]))
     for must_say in ("stopping rule, not the choosing", "synthetic", "invented"):
         assert must_say in src, f"figure no longer states: {must_say}"
+
+
+# ---------------------------------------------------------------------------
+# archive-shaped batch: masters + access copies, missing metadata, 16-bit
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def archive(tmp_path_factory):
+    d = tmp_path_factory.mktemp("archive")
+    gt = make_archive_fixtures(d)
+    summary = run_qc(d, out_dir=d / "_qc", expected_dpi=600, access_dpi=300)
+    return gt, summary
+
+
+def _row(summary, fname):
+    return next(x for x in summary["files"] if x["file"] == fname)
+
+
+def test_archive_access_copies_are_neither_format_failures_nor_duplicates(archive):
+    gt, s = archive
+    for fname, meta in gt.items():
+        if meta["role"] != "access":
+            continue
+        row = _row(s, fname)
+        assert row["role"] == "access"
+        assert _status(s, fname, "format") == "pass", fname
+        assert _status(s, fname, "duplicate") == "pass", f"{fname} flagged as a duplicate of its master"
+        assert _status(s, fname, "dpi") == "pass", fname
+
+
+def test_archive_every_injected_outcome_and_nothing_else(archive):
+    gt, s = archive
+    for fname, meta in gt.items():
+        row = _row(s, fname)
+        expected = {d.partition(":")[0]: (d.partition(":")[2] or "fail") for d in meta["defects"]}
+        fired = {c["check"]: c["status"] for c in row["checks"] if c["status"] != "pass"}
+        assert fired == expected, f"{fname}: fired {fired}, expected {expected}"
+        assert row["action"] == ("accept" if not expected else "review"), fname
+
+
+def test_missing_resolution_metadata_is_a_review_not_a_reprocess(archive):
+    gt, s = archive
+    row = _row(s, "photo_0003.tif")
+    dpi = next(c for c in row["checks"] if c["check"] == "dpi")
+    assert dpi["status"] == "warn" and dpi["value"] is None
+    assert "metadata" in dpi["note"]
+    assert row["action"] == "review"
+
+
+def test_16bit_master_is_read_at_the_right_scale(archive):
+    gt, s = archive
+    row = _row(s, "photo_0004.tif")
+    exp = next(c for c in row["checks"] if c["check"] == "exposure")
+    assert exp["status"] == "pass", exp
+    assert 90 <= exp["value"] <= 245
+
+
+def test_pairing_flags_the_master_without_access_copy_and_the_orphan(archive):
+    gt, s = archive
+    assert _status(s, "photo_0005.tif", "pairing") == "warn"
+    assert _status(s, "photo_0006.jpg", "pairing") == "warn"
+    for fname in ("photo_0001.tif", "photo_0001.jpg", "photo_0004.jpg"):
+        assert _status(s, fname, "pairing") == "pass", fname
+
+
+def test_without_access_dpi_the_old_behaviour_is_unchanged(tmp_path):
+    d = tmp_path / "plain"
+    make_archive_fixtures(d)
+    s = run_qc(d, out_dir=d / "_qc", expected_dpi=600)
+    jpg = _row(s, "photo_0001.jpg")
+    assert jpg["action"] == "reprocess" and _status(s, "photo_0001.jpg", "format") == "fail"
+    assert "role" not in jpg or jpg["role"] == "master"

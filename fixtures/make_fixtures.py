@@ -141,3 +141,53 @@ def make_vlm_fixtures(out: Path) -> dict:
 
     (out / "_ground_truth.json").write_text(json.dumps({"missing": [], "files": gt}, indent=2))
     return gt
+
+
+# ---------------------------------------------------------------------------
+# an archive-shaped batch: TIFF masters + JPEG access copies, one file per page
+# ---------------------------------------------------------------------------
+MASTER_DPI, ACCESS_DPI = 600, 300
+
+
+def make_archive_fixtures(out: Path) -> dict:
+    """What a case-by-case scanning archive actually keeps.
+
+    Every page has a preservation master (TIFF, 600 ppi) and an access copy
+    (JPEG, 300 ppi).  Faults here are the ones a mixed, years-old folder has:
+    a master with no resolution metadata, a 16-bit master, a page whose access
+    copy was never made, and an access copy whose master is gone.  Ground truth
+    records role and expected check outcomes; ``:warn`` marks a warning.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    gt: dict[str, dict] = {}
+    pages = {i: render_page(300 + i) for i in range(1, 7)}
+
+    def master(i, img, **kw):
+        n = f"photo_{i:04d}.tif"
+        img.save(out / n, format="TIFF", **kw)
+        return n
+
+    def access(i, img):
+        n = f"photo_{i:04d}.jpg"
+        small = img.resize((W // 2, H // 2), Image.LANCZOS)
+        small.save(out / n, format="JPEG", quality=85, dpi=(ACCESS_DPI, ACCESS_DPI))
+        return n
+
+    for i in (1, 2):
+        gt[master(i, pages[i], dpi=(MASTER_DPI, MASTER_DPI))] = {"role": "master", "defects": []}
+        gt[access(i, pages[i])] = {"role": "access", "defects": []}
+    # 3: master saved without any resolution metadata
+    gt[master(3, pages[3])] = {"role": "master", "defects": ["dpi:warn"]}
+    gt[access(3, pages[3])] = {"role": "access", "defects": []}
+    # 4: 16-bit master, correctly exposed once read at the right scale
+    arr16 = (np.asarray(pages[4], dtype=np.uint16) * 257)
+    gt[master(4, Image.fromarray(arr16), dpi=(MASTER_DPI, MASTER_DPI))] = {"role": "master", "defects": []}
+    gt[access(4, pages[4])] = {"role": "access", "defects": []}
+    # 5: master whose access copy was never made
+    gt[master(5, pages[5], dpi=(MASTER_DPI, MASTER_DPI))] = {"role": "master", "defects": ["pairing:warn"]}
+    # 6: access copy whose master is gone
+    gt[access(6, pages[6])] = {"role": "access", "defects": ["pairing:warn"]}
+
+    (out / "_ground_truth.json").write_text(json.dumps({"files": gt, "master_dpi": MASTER_DPI,
+                                                         "access_dpi": ACCESS_DPI}, indent=2))
+    return gt
