@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures.make_fixtures import make, make_vlm_fixtures, make_archive_fixtures
 from fixtures.make_rti_stack import make_stack
 from mhs_shim.backends.folder_scanner import VirtualScanner
-from qc.agent import run_qc
+from qc.agent import run_qc, CannotRun
 from qc.vlm import make_backend
 from qc.rti_experiment import run as run_rti, render as render_rti
 from qc.rti_figure import build as build_rti_figure
@@ -56,9 +56,19 @@ def main(argv=None):
         print(VirtualScanner(args.folder).reference_doc())
     elif args.cmd == "qc":
         backend = make_backend(args.vlm)
-        s = run_qc(args.folder, out_dir=args.out, expected_dpi=args.dpi, access_dpi=args.access_dpi,
-                   vlm=backend, vlm_mode=args.vlm_mode if backend else "none")
+        try:
+            s = run_qc(args.folder, out_dir=args.out, expected_dpi=args.dpi, access_dpi=args.access_dpi,
+                       vlm=backend, vlm_mode=args.vlm_mode if backend else "none")
+        except CannotRun as e:
+            # A clear refusal, not a traceback: the operator needs to know which file
+            # could not be read, not where in our code the reader gave up.
+            raise SystemExit(f"REFUSED: {e}")
         print(f"{s['n_files']} files  actions={s['actions']}  missing={s['missing_sequence']}")
+        if s["n_unreadable"]:
+            names = [u["file"] for u in s["unreadable"]]
+            print(f"could not be read: {s['n_unreadable']} of {s['read_coverage']['attempted']} "
+                  f"-> {names[:5]}{' ...' if len(names) > 5 else ''}"
+                  f"  (listed in report.md; not counted as checked)")
         v = s["vlm"]
         if v["backend"]:
             print(f"vlm {v['backend']} mode={v['mode']} judged={v['n_judged']} errors={v['n_errors']} "

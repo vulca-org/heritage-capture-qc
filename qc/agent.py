@@ -48,6 +48,13 @@ def triage(results: list[C.CheckResult]) -> str:
     return "accept"
 
 
+class CannotRun(RuntimeError):
+    """Raised when the batch cannot support a quality check at all.
+
+    A check that could not run must never render as a check that ran and passed.
+    """
+
+
 def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dpi: int | None = None,
            vlm=None, vlm_mode: str = "none", batch_context: str = "", access_dpi: int | None = None) -> dict:
     dev = VirtualScanner(batch_dir, expected_dpi=expected_dpi or 400, out_dir=out_dir)
@@ -57,10 +64,24 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
     manifest = dev.read("batch_manifest")
 
     # pass 1: per-file measurements
-    per_file = []
+    #
+    # A file the reader cannot open is recorded and skipped, never allowed to end the
+    # run. A real archive folder contains strays (a renamed text file, a zero-byte
+    # transfer, a PDF among the TIFFs); one of them must not cost the operator the
+    # report on the other two hundred captures. The skipped files are carried through
+    # to the summary with their reason, so "could not be read" stays visible and can
+    # never be mistaken for "checked and accepted".
+    per_file, unreadable = [], []
     for item in manifest:
-        img = dev.read("image", path=item["path"])
-        gray = C.to_gray(img)
+        try:
+            img = dev.read("image", path=item["path"])
+            gray = C.to_gray(img)
+        except Exception as e:
+            unreadable.append({"file": item["name"], "path": item["path"],
+                               "seq": item.get("seq"), "role": None,
+                               "action": "unreadable", "checks": [],
+                               "reason": f"{type(e).__name__}: {e}"})
+            continue
         is_access = access_dpi is not None and (
             (img.format or "").upper() == "JPEG" or Path(item["name"]).suffix.lower() in (".jpg", ".jpeg"))
         per_file.append({
@@ -71,6 +92,12 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
             "vec": C.thumb_vector(gray),
             "region": C.region_vector(gray),
         })
+
+    if not per_file:
+        raise CannotRun(
+            f"none of the {len(manifest)} files in {Path(batch_dir)} could be read as an image. "
+            "Refusing rather than emitting a report with nothing measured in it. "
+            + (f"First reason: {unreadable[0]['reason']}" if unreadable else ""))
 
     # Batch-relative statistics are computed within a role. An access copy is,
     # by construction, a near-duplicate of its master and softer than it; only
@@ -165,9 +192,16 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         reshoot = [r["file"] for r in report if r["action"] == "reshoot"]
 
     dev.write("reshoot_list", reshoot)
+    # Unreadable files join the per-file table so they cannot disappear from it, and
+    # are counted in `actions` so the headline counts add up to what was attempted.
+    report = report + unreadable
     summary = {
         "batch": str(Path(batch_dir)),
         "n_files": len(per_file),
+        "n_unreadable": len(unreadable),
+        "read_coverage": {"attempted": len(manifest), "readable": len(per_file),
+                          "unreadable": len(unreadable)},
+        "unreadable": unreadable,
         "expected_dpi": dpi,
         "access_dpi": access_dpi,
         "roles": dict(Counter(f["role"] for f in per_file)),
@@ -216,7 +250,10 @@ def render_md(s: dict) -> str:
             seen = "; ".join(f"**{i['issue']}** ({i['severity']}): {i['evidence']}" for i in v["issues"])
         else:
             seen = "nothing"
-        lines.append(f"| {f['file']} | {f['seq']} | {f.get('role', 'master')} | **{f['action']}** | {rules or '—'} | {seen} |")
+        if f["action"] == "unreadable":
+            rules = f"could not be read — {f.get('reason', 'no reason recorded')}"
+        lines.append(f"| {f['file']} | {f.get('seq') if f.get('seq') is not None else '—'} | "
+                     f"{f.get('role') or '—'} | **{f['action']}** | {rules or '—'} | {seen} |")
     lines += ["", "## Reshoot list"]
     lines += [f"- {n}" for n in s["reshoot"]] or ["- none"]
     return "\n".join(lines) + "\n"
