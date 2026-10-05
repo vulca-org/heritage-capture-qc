@@ -26,6 +26,11 @@ def main(argv=None):
     c.add_argument("--vlm-mode", default="flagged", help="none | flagged | all | sample:N")
     c.add_argument("--access-dpi", type=int, default=None,
                    help="declared resolution of JPEG access copies; when set, JPEGs are checked as access copies and paired with masters")
+    c.add_argument("--naming", choices=["trailing", "ref"], default="trailing",
+                   help="trailing: sequence number before the extension; ref: archive reference code at the start "
+                        "(last number = item, the rest = group)")
+    c.add_argument("--material", choices=["page", "photo"], default="page",
+                   help="photo: plates, negatives, prints; the page margin check is not applied")
     d = sub.add_parser("rti-stack", help="synthesise a physically-rendered RTI light stack")
     d.add_argument("out"); d.add_argument("--seed", type=int, default=7)
     d.add_argument("--noise", type=float, default=0.012)
@@ -58,12 +63,17 @@ def main(argv=None):
         backend = make_backend(args.vlm)
         try:
             s = run_qc(args.folder, out_dir=args.out, expected_dpi=args.dpi, access_dpi=args.access_dpi,
-                       vlm=backend, vlm_mode=args.vlm_mode if backend else "none")
+                       vlm=backend, vlm_mode=args.vlm_mode if backend else "none",
+                       naming=args.naming, material=args.material)
         except CannotRun as e:
             # A clear refusal, not a traceback: the operator needs to know which file
             # could not be read, not where in our code the reader gave up.
             raise SystemExit(f"REFUSED: {e}")
         print(f"{s['n_files']} files  actions={s['actions']}  missing={s['missing_sequence']}")
+        if s["groups"]:
+            print(f"groups: {s['groups']}")
+        if s["not_applied"]:
+            print(f"not applied: {s['not_applied']}")
         if s["n_unreadable"]:
             names = [u["file"] for u in s["unreadable"]]
             print(f"could not be read: {s['n_unreadable']} of {s['read_coverage']['attempted']} "

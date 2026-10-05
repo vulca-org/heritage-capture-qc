@@ -18,6 +18,13 @@ from ..device import Device
 
 IMAGE_EXT = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 SEQ_RE = re.compile(r"(\d+)(?=\.[A-Za-z]+$)")
+# An archive reference code at the start of the name: a short letter prefix, then
+# numbers joined by hyphens, e.g. "AB 12-3-7-4 Street scene 1901.tif". The last
+# number is the item; everything before it names the group (a job, a box, a
+# volume). Under the trailing rule the year closing such a title is read as the
+# sequence number, so a reference-coded folder must be read with this rule.
+REF_RE = re.compile(r"^([A-Za-z]{1,6} ?\d+(?:-\d+)+)-(\d+)(?=[\s_.]|$)")
+NAMING = ("trailing", "ref")
 
 
 class VirtualScanner(Device):
@@ -31,15 +38,22 @@ class VirtualScanner(Device):
         "reshoot_list": "write the list of files to recapture (value: list of file names)",
     }
 
-    def __init__(self, folder: str | Path, expected_dpi: int = 400, out_dir: str | Path | None = None):
+    def __init__(self, folder: str | Path, expected_dpi: int = 400, out_dir: str | Path | None = None,
+                 naming: str = "trailing"):
+        if naming not in NAMING:
+            raise ValueError(f"naming must be one of {NAMING}, not {naming!r}")
         self.folder = Path(folder)
         self.expected_dpi = expected_dpi
+        self.naming = naming
         self.out_dir = Path(out_dir) if out_dir else self.folder / "_qc"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         tags = {
             "what it is": "A capture folder that stands in for a book scanner. Images appear as files; "
                           "nothing here moves, so it cannot harm an object.",
-            "naming": "Files carry a trailing sequence number before the extension, e.g. batch01_p007.tif.",
+            "naming": ("Files carry a trailing sequence number before the extension, e.g. batch01_p007.tif."
+                       if naming == "trailing" else
+                       "Files open with an archive reference code; the last number is the item and the "
+                       "rest names its group, e.g. AB 12-3-7-4 Title.tif is item 4 of group AB 12-3-7."),
             "declared resolution": f"{expected_dpi} ppi",
             "safety": "No exposure is spent by reading files; no object manifest is needed.",
         }
@@ -51,8 +65,15 @@ class VirtualScanner(Device):
         files = sorted(p for p in self.folder.iterdir() if p.suffix.lower() in IMAGE_EXT and not p.name.startswith("_"))
         out = []
         for p in files:
-            m = SEQ_RE.search(p.name)
-            out.append({"path": str(p), "name": p.name, "seq": int(m.group(1)) if m else None,
+            group, seq = None, None
+            if self.naming == "ref":
+                m = REF_RE.match(p.name)
+                if m:
+                    group, seq = m.group(1), int(m.group(2))
+            else:
+                m = SEQ_RE.search(p.name)
+                seq = int(m.group(1)) if m else None
+            out.append({"path": str(p), "name": p.name, "seq": seq, "group": group,
                         "bytes": p.stat().st_size})
         return out
 

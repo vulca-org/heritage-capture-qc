@@ -15,6 +15,8 @@ import numpy as np
 from PIL import Image
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
+#: the check was not applied to this file; never counted as a pass
+SKIP = "skip"
 
 
 @dataclass

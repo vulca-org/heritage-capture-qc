@@ -23,6 +23,11 @@ REPROCESS = {"format", "dpi", "bit_depth"}
 #: how far each action is from "fine"; escalation only ever moves up this scale
 RANK = {"accept": 0, "review": 1, "reprocess": 2, "reshoot": 3}
 
+#: what was scanned. A page carries ink on paper with a margin round it; a
+#: photograph (plate, negative, print) fills its frame, so the margin check
+#: does not apply to it.
+MATERIALS = ("page", "photo")
+
 
 def escalate(action: str, worst: str | None) -> str:
     """Apply a VLM verdict to a rule-derived action.
@@ -56,8 +61,11 @@ class CannotRun(RuntimeError):
 
 
 def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dpi: int | None = None,
-           vlm=None, vlm_mode: str = "none", batch_context: str = "", access_dpi: int | None = None) -> dict:
-    dev = VirtualScanner(batch_dir, expected_dpi=expected_dpi or 400, out_dir=out_dir)
+           vlm=None, vlm_mode: str = "none", batch_context: str = "", access_dpi: int | None = None,
+           naming: str = "trailing", material: str = "page") -> dict:
+    if material not in MATERIALS:
+        raise ValueError(f"material must be one of {MATERIALS}, not {material!r}")
+    dev = VirtualScanner(batch_dir, expected_dpi=expected_dpi or 400, out_dir=out_dir, naming=naming)
     # The agent reads the device's own description before acting.
     doc = dev.reference_doc()
     dpi = dev.read("expected_dpi")
@@ -105,10 +113,17 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
     groups: dict[str, list[int]] = {}
     for i, f in enumerate(per_file):
         groups.setdefault(f["role"], []).append(i)
-    med_sharp_by_role, dup_exact, dup_near, region_results = {}, {}, {}, {}
-    missing_by_role, dupseq_by_role = {}, {}
+    # Within a role, frames are compared with frames from the same group (a job,
+    # a box, a volume) when the names say which group that is. A job shot on a
+    # softer medium is not a focus fault, and a gap or repeat in numbering only
+    # means something inside the run that did the numbering. Without reference
+    # codes every frame of a role is one group, as before.
+    cmp_groups: dict[tuple, list[int]] = {}
+    for i, f in enumerate(per_file):
+        cmp_groups.setdefault((f["role"], f["item"].get("group")), []).append(i)
+    med_sharp_by_group, dup_exact, dup_near, region_results = {}, {}, {}, {}
+    missing_by_role, dupseq_by_group = {}, {}
     for role, idx in groups.items():
-        med_sharp_by_role[role] = float(np.median([per_file[i]["sharp"] for i in idx]))
         seen_sha = {}
         for pos, i in enumerate(idx):
             f = per_file[i]
@@ -121,10 +136,14 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
                     if float(np.dot(f["vec"], per_file[j]["vec"])) >= 0.998:
                         dup_near[i] = j
                         break
-        missing_by_role[role], dupseq_by_role[role] = C.check_sequence([per_file[i]["item"]["seq"] for i in idx])
+    for (role, grp), idx in cmp_groups.items():
+        med_sharp_by_group[(role, grp)] = float(np.median([per_file[i]["sharp"] for i in idx]))
+        miss, dupseq_by_group[(role, grp)] = C.check_sequence([per_file[i]["item"]["seq"] for i in idx])
+        missing_by_role.setdefault(role, []).extend(m if grp is None else f"{grp}-{m}" for m in miss)
         for i, r in zip(idx, C.batch_region_consistency([per_file[i]["region"] for i in idx])):
             region_results[i] = r
-    med_sharp = med_sharp_by_role.get("master", 0.0)
+    masters = [f["sharp"] for f in per_file if f["role"] == "master"]
+    med_sharp = float(np.median(masters)) if masters else 0.0
     missing = missing_by_role.get("master", [])
 
     # master <-> access pairing, by file stem (photo_0007.tif <-> photo_0007.jpg)
@@ -135,21 +154,31 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
     report, reshoot = [], []
     for i, f in enumerate(per_file):
         img, gray, item, role = f["img"], f["gray"], f["item"], f["role"]
+        key = (role, item.get("group"))
+        if key[1] is not None and len(cmp_groups[key]) < 3:
+            blur = C.CheckResult("blur", C.SKIP, None, None, "too few frames in this group to compare")
+        else:
+            blur = C.check_blur(f["sharp"], med_sharp_by_group[key])
+        if material == "photo":
+            margins = C.CheckResult("margins", C.SKIP, None, None,
+                                    "not applied: a photograph fills its frame by design")
+        else:
+            margins = C.check_margins(gray)
         res = [
             C.check_format(img, role),
             C.check_dpi(img, access_dpi if role == "access" else dpi),
             C.check_bit_depth(img),
-            C.check_blur(f["sharp"], med_sharp_by_role[role]),
+            blur,
             C.check_glare(gray),
             C.check_exposure(gray),
             C.check_skew(C.estimate_skew(gray)),
-            C.check_margins(gray),
+            margins,
             region_results[i],
         ]
         if access_dpi is not None:
             other = "access" if role == "master" else "master"
             res.append(C.check_pairing(role, Path(item["name"]).stem.lower() in stems_by_role.get(other, set())))
-        dup_seq = dupseq_by_role[role]
+        dup_seq = dupseq_by_group[key]
         if i in dup_exact:
             res.append(C.CheckResult("duplicate", C.FAIL, per_file[dup_exact[i]]["item"]["name"], "sha256",
                                      "byte-identical to an earlier capture"))
@@ -162,7 +191,7 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         if action == "reshoot":
             reshoot.append(item["name"])
         for r in res:
-            if r.status != C.PASS:
+            if r.status in (C.WARN, C.FAIL):
                 dev.write("flag", {"file": item["name"], **r.to_dict()})
         report.append({"file": item["name"], "seq": item["seq"], "role": role, "action": action,
                        "checks": [r.to_dict() for r in res]})
@@ -173,7 +202,9 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         by_name = {r["file"]: r for r in report}
         path_of = {f["item"]["name"]: f["item"]["path"] for f in per_file}
         ctx = batch_context or (f"Batch of {len(per_file)} frames captured at {dpi} ppi. "
-                                "Frames in this batch normally show a single page and nothing else.")
+                                + ("Frames in this batch normally show a single page and nothing else."
+                                   if material == "page" else
+                                   "Frames in this batch are photographs scanned from plates or negatives."))
         # only masters go to the model; an access copy shows the same picture
         for fname in select_for_vlm([r for r in report if r["role"] == "master"], vlm_mode):
             v: VLMVerdict = vlm.judge(path_of[fname], ctx)
@@ -204,6 +235,10 @@ def run_qc(batch_dir: str | Path, out_dir: str | Path | None = None, expected_dp
         "unreadable": unreadable,
         "expected_dpi": dpi,
         "access_dpi": access_dpi,
+        "naming": naming,
+        "material": material,
+        "groups": dict(Counter(f["item"]["group"] for f in per_file if f["item"].get("group") is not None)),
+        "not_applied": dict(Counter(c["check"] for r in report for c in r["checks"] if c["status"] == C.SKIP)),
         "roles": dict(Counter(f["role"] for f in per_file)),
         "batch_median_sharpness": round(med_sharp, 4),
         "missing_sequence": missing,
@@ -234,13 +269,17 @@ def render_md(s: dict) -> str:
              f"files: {s['n_files']}  declared: {s['expected_dpi']} ppi"
              + (f" (access copies {s['access_dpi']} ppi, roles {s['roles']})" if s.get("access_dpi") else "")
              + f"  actions: {s['actions']}",
+             f"naming: {s.get('naming', 'trailing')}  material: {s.get('material', 'page')}"
+             + (f"  groups: {s['groups']}" if s.get("groups") else ""),
              f"missing sequence numbers: {s['missing_sequence'] or 'none'}",
+             (f"not applied: " + ", ".join(f"{k} ({v} files)" for k, v in s["not_applied"].items()))
+             if s.get("not_applied") else "not applied: none",
              (f"VLM: {s['vlm']['backend']} mode={s['vlm']['mode']} judged={s['vlm']['n_judged']} "
               f"errors={s['vlm']['n_errors']} escalated={s['vlm']['escalated'] or 'none'}")
              if s.get("vlm", {}).get("backend") else "VLM: not run", "",
              "| file | seq | role | action | measured faults | seen by VLM |", "|---|---|---|---|---|---|"]
     for f in s["files"]:
-        rules = ", ".join(f"{c['check']}={c['value']}" for c in f["checks"] if c["status"] != "pass")
+        rules = ", ".join(f"{c['check']}={c['value']}" for c in f["checks"] if c["status"] in ("warn", "fail"))
         v = f.get("vlm")
         if not v:
             seen = "—"
